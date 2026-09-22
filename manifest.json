@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "andreinita21.omamonitor",
+  "name": "Omamonitor",
+  "version": "1.0.0",
+  "author": "andreinita21",
+  "description": "Display panel with a drag-and-drop monitor arrangement editor: position, resolution, refresh rate, scale and rotation, applied live and saved to monitors.lua",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omamonitor",
+    "description": "Brightness, text size and a drag-and-drop monitor arrangement editor",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.monitor"
+  }
+}
