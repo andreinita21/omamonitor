@@ -25,6 +25,10 @@ widget already does: the brightness slider and the text size slider.
 - **Per-monitor settings.** Resolution and refresh rate from the modes the
   monitor actually reports, scale presets limited to values Hyprland accepts
   for that mode, and rotation in 90° steps.
+- **Keeps custom modes.** A mode the monitor does not advertise (for example
+  3440x1440 on an ultrawide whose HDMI EDID only lists 16:9 modes, set by
+  hand once) is written as a CVT reduced-blanking `modeline`, so arranging
+  monitors or reloading Hyprland does not drop it back to the preferred mode.
 - **Applies as you go.** Every change is pushed live with `hyprctl eval`
   and written to `monitors.lua` in one step. Quick successive changes are
   coalesced.

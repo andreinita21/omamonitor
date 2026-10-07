@@ -531,7 +531,30 @@ function isInternal(name) {
   return /^(eDP|LVDS|DSI)-/.test(String(name || ""))
 }
 
+function hasMode(entry) {
+  var modes = entry.modes || []
+  for (var i = 0; i < modes.length; i++) {
+    if (modes[i].width === entry.width && modes[i].height === entry.height
+        && refreshLabel(modes[i].refresh) === refreshLabel(entry.refresh)) return true
+  }
+  return false
+}
+
+// A mode the EDID does not list (e.g. 3440x1440 over an HDMI input that only
+// advertises 16:9) cannot be rebuilt by Hyprland from "WxH@R"; it falls back
+// to the preferred mode. Such modes go out as a CVT reduced-blanking
+// modeline instead: 160 px horizontal blanking, at least 460 us vertical.
+function customModeline(entry) {
+  var w = entry.width, h = entry.height, r = roundRefresh(entry.refresh)
+  var htotal = w + 160
+  var vtotal = Math.max(h + 14, Math.ceil(h / (1 - 460e-6 * r)))
+  var clock = (htotal * vtotal * r / 1e6).toFixed(2)
+  return "modeline " + clock + " " + w + " " + (w + 48) + " " + (w + 80) + " " + htotal
+    + " " + h + " " + (h + 3) + " " + (h + 8) + " " + vtotal + " +hsync -vsync"
+}
+
 function modeString(entry) {
+  if (entry.modes && entry.modes.length > 0 && !hasMode(entry) && entry.refresh > 0) return customModeline(entry)
   return entry.width + "x" + entry.height + "@" + refreshLabel(entry.refresh)
 }
 

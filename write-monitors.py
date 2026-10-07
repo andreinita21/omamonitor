@@ -18,7 +18,9 @@ import sys
 import tempfile
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-MODE_RE = re.compile(r"^\d+x\d+@\d+(\.\d+)?$")
+MODE_RE = re.compile(
+    r"^(\d+x\d+@\d+(\.\d+)?|modeline \d+(\.\d+)?( \d+){8} [+-]hsync [+-]vsync)$"
+)
 POSITION_RE = re.compile(r"^-?\d+x-?\d+$")
 SCALE_RE = re.compile(r"^\d+(\.\d+)?$")
 GDK_RE = re.compile(r'^hl\.env\("GDK_SCALE",\s*"?(\d+)"?\)', re.M)
