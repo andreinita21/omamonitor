@@ -33,7 +33,8 @@ widget already does: the brightness slider and the text size slider.
 - **Per-app scaling.** Every app with an open window gets a row with
   Auto, 1×, 1.1×, 1.25×, 1.5×, 1.75× and 2×. Hyprland scales whole
   monitors, not single windows, so the factor is applied through the app's
-  own toolkit the next time it starts. See [Per-app scaling](#per-app-scaling).
+  own toolkit: open foot windows resize on the spot, and other apps get a
+  one-click relaunch. See [Per-app scaling](#per-app-scaling).
 - **Applies as you go.** Every change is pushed live with `hyprctl eval`
   and written to `monitors.lua` in one step. Quick successive changes are
   coalesced.
@@ -149,8 +150,30 @@ What a factor means depends on how the app talks to the display:
   the app's whole scale and it looks the same size on every monitor. The
   row says so.
 
-Apps only read the factor at startup. When an open window runs at a
-different factor than the one saved, its row says `relaunch to apply`.
+### Live changes and relaunching
+
+A monitor's scale changes live because Hyprland tells every app about it
+through the Wayland protocol and the apps redraw. There is no such message
+for one app's own factor, and the switches above (environment variables,
+command-line flags) are only read when an app starts. So:
+
+- **foot follows live.** Omamonitor sends foot's own zoom keys to every open
+  foot window (`Ctrl+0`, then `Ctrl+=` or `Ctrl+-` the right number of
+  times) through Hyprland, without focusing it. Zoom moves in foot's
+  `font-size-adjustment` steps (0.5 pt unless foot.ini sets another), so
+  the result is the closest step to the factor. It also resets any zoom you
+  had in those windows.
+- **Other apps relaunch with one click.** While an open window still runs at
+  the old factor, the row says `relaunch to apply` and shows a 󰑓 button.
+  It closes the app's windows one at a time, the way you would, and starts
+  it again from its desktop entry. If a window stays open (an app asking to
+  save its work), it stops and tells you instead of killing anything. An
+  app that keeps running in the tray after its windows close is asked to
+  quit. Browsers are asked to quit as a whole and come back with
+  `--restore-last-session`, so tabs and windows return.
+- **Other terminals** (Alacritty, kitty, Ghostty) are never relaunched,
+  since that would end whatever runs inside them; new windows get the
+  factor.
 
 From a keybinding or a script, the same change goes through IPC, using the
 browser name or the app's desktop entry id:
@@ -158,6 +181,7 @@ browser name or the app's desktop entry id:
 ```bash
 omarchy-shell omarchy.monitor appScale chromium 1.25
 omarchy-shell omarchy.monitor appScale foot auto
+omarchy-shell omarchy.monitor appRelaunch chromium
 ```
 
 ## What it writes
@@ -192,7 +216,8 @@ the lid brings it back to its previous position and scale.
 App scaling writes only the `--force-device-scale-factor` line of a
 browser's flags file, and only the `Exec` lines and `X-Omamonitor-*` keys
 of a desktop entry. Files that are symlinks (a dotfiles setup, for
-example) are updated in place.
+example) are updated in place. Which foot windows were resized live is kept in
+`$XDG_RUNTIME_DIR/omamonitor-live.json`, which goes away on logout.
 
 ## How it works
 
@@ -202,7 +227,7 @@ example) are updated in place.
 | `Model.js` | Pure layout logic: parsing `hyprctl monitors all -j`, snapping and placement, mode and scale lists, Lua generation |
 | `display-state.sh` | Reads the monitor list, lid state, clamshell state and the outputs pinned off in `monitors.lua` |
 | `write-monitors.py` | Validates the layout and rewrites `monitors.lua` atomically |
-| `app-scale.py` | Lists the open apps and their toolkits, and writes the flags files and desktop entry overrides |
+| `app-scale.py` | Lists the open apps and their toolkits, writes the flags files and desktop entry overrides, resizes open foot windows and relaunches apps |
 | `omamonitor-scale-run` | Starts an app at its factor; copied to `~/.local/bin` when first needed |
 
 Changes are applied with `hyprctl eval` and `hl.monitor()` calls rather than

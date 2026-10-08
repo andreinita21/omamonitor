@@ -19,7 +19,8 @@ import "Model.js" as Model
 // App scaling lists the open apps (plus browsers and apps already scaled) and
 // sets a factor for each through app-scale.py: a browser's flags file, or a
 // desktop entry override that starts the app through omamonitor-scale-run.
-// It takes effect when the app restarts.
+// Open foot windows follow at once (app-scale.py presses foot's zoom keys);
+// other apps read the factor at startup, so a stale row offers a relaunch.
 //
 // Connected displays are switched on automatically. The exceptions are the
 // laptop panel while Omarchy's clamshell handling holds it off (lid closed)
@@ -89,9 +90,10 @@ Panel {
   // ---- App scaling ----
   // From `app-scale.py list`: { id, name, method, kind, file, scale ("" =
   // auto), xwayland, supported, reason, open, stale (an open window runs at
-  // another factor) }.
+  // another factor), relaunchable }.
   property var apps: []
   property var pendingAppScale: null
+  property string relaunchingApp: ""
   readonly property var appScalePresets: ["auto", "1", "1.1", "1.25", "1.5", "1.75", "2"]
   readonly property var resolutionOptions: selectedEntry ? Model.resolutionOptions(selectedEntry) : []
   readonly property var refreshOptions: selectedEntry ? Model.refreshOptions(selectedEntry) : []
@@ -152,7 +154,7 @@ Panel {
     if (section === "monitors") return draft.length
     if (section === "scale") return scaleValues.length
     if (section === "rotation") return rotationValues.length
-    if (appIdOf(section)) return appScalePresets.length
+    if (appIdOf(section)) return appOptions(appById(appIdOf(section))).length
     return 0
   }
 
@@ -248,8 +250,10 @@ Panel {
       return
     }
     var appId = appIdOf(focusSection)
-    if (appId && selectedIndex >= 0 && selectedIndex < appScalePresets.length)
-      setAppScale(appId, appScalePresets[selectedIndex])
+    var options = appOptions(appById(appId))
+    if (!appId || selectedIndex < 0 || selectedIndex >= options.length) return
+    if (options[selectedIndex] === "relaunch") relaunchApp(appId)
+    else setAppScale(appId, options[selectedIndex])
   }
 
   function clampCursor() {
@@ -329,6 +333,7 @@ Panel {
     function state(): string { return root.stateIpc() }
     function refresh(): void { root.refresh() }
     function appScale(id: string, scale: string): string { return root.appScaleIpc(id, scale) }
+    function appRelaunch(id: string): string { return root.appRelaunchIpc(id) }
     function open() { root.open() }
     function close() { root.close() }
     function toggle() { root.toggle() }
@@ -339,7 +344,7 @@ Panel {
   function refresh() {
     if (!stateProc.running) stateProc.running = true
     if (!monitorsProc.running) monitorsProc.running = true
-    if (root.opened && !appsProc.running && !appSetProc.running) appsProc.running = true
+    if (root.opened && !appsProc.running && !appSetProc.running && !appRelaunchProc.running) appsProc.running = true
   }
 
   // ---- Brightness ----
@@ -615,6 +620,35 @@ Panel {
     appSetProc.running = true
   }
 
+  function appById(id) {
+    for (var i = 0; i < root.apps.length; i++) if (root.apps[i].id === id) return root.apps[i]
+    return null
+  }
+
+  // Scale presets, plus a relaunch button while an open window still runs
+  // at the old factor and the app can be restarted.
+  function appOptions(app) {
+    if (app && app.stale && app.relaunchable) return root.appScalePresets.concat(["relaunch"])
+    return root.appScalePresets
+  }
+
+  function relaunchApp(id) {
+    var app = appById(id)
+    if (!app || !app.relaunchable || appRelaunchProc.running || appSetProc.running) return
+    root.applyError = ""
+    root.relaunchingApp = id
+    appRelaunchProc.command = ["python3", root.pluginDir + "/app-scale.py", "relaunch", id]
+    appRelaunchProc.running = true
+  }
+
+  function appRelaunchIpc(id) {
+    var app = appById(id)
+    if (!app) return "unknown app " + id
+    if (!app.relaunchable) return app.name + " cannot be relaunched"
+    relaunchApp(id)
+    return "ok"
+  }
+
   function appScaleIpc(id, scale) {
     for (var i = 0; i < root.apps.length; i++) {
       if (root.apps[i].id !== id) continue
@@ -638,12 +672,15 @@ Panel {
   function appHint(app) {
     if (!app) return ""
     if (!app.supported) return app.reason
-    if (app.stale) return "relaunch to apply"
+    if (root.relaunchingApp === app.id) return "relaunching…"
+    if (app.stale) return app.relaunchable ? "relaunch to apply" : "applies to new windows"
+    if (app.kind === "foot") return "font size × the factor · live"
     if (app.xwayland) return "XWayland · same on every monitor"
     if (app.kind === "gtk3") return "GTK 3 · scales text only"
-    if (["foot", "alacritty", "kitty", "ghostty"].indexOf(app.kind) >= 0) return "font size × the factor"
+    if (["alacritty", "kitty", "ghostty"].indexOf(app.kind) >= 0) return "font size × the factor"
     return "× the monitor scale"
   }
+
 
   // ---- Text size (shell base font + GTK text-scaling, via one CLI) ----
   function nearestTextStop(px) {
@@ -784,6 +821,27 @@ Panel {
       if (pending) { root.setAppScale(pending.id, pending.scale); return }
       if (!appsProc.running) appsProc.running = true
     }
+  }
+
+  Process {
+    id: appRelaunchProc
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: appRelaunchErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running) return
+      var err = String(appRelaunchErr.text || "").trim()
+      if (err) root.applyError = err.split("\n")[0].replace(/^error: /, "")
+      root.relaunchingApp = ""
+      // Give the new instance a moment to map its window before re-reading.
+      appRelaunchSettle.restart()
+    }
+  }
+
+  Timer {
+    id: appRelaunchSettle
+    interval: 1500
+    repeat: false
+    onTriggered: if (!appsProc.running) appsProc.running = true
   }
 
   Timer {
@@ -1598,7 +1656,7 @@ Panel {
               Text {
                 id: appHeaderHint
                 textFormat: Text.PlainText
-                text: "open apps · applies the next time an app starts"
+                text: "open apps · foot resizes live, other apps relaunch"
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1670,6 +1728,10 @@ Panel {
 
     readonly property string section: app ? "app:" + app.id : ""
     readonly property bool supported: app ? app.supported === true : false
+    // Every row keeps a slot for the relaunch button so the columns line up;
+    // it only shows (and takes the cursor) while a relaunch would help.
+    readonly property var slots: root.appScalePresets.concat(["relaunch"])
+    readonly property bool canRelaunch: root.appOptions(app).length > root.appScalePresets.length
     readonly property bool hasCursor: root.cursorActive && root.focusSection === section
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(appRow)
 
@@ -1712,25 +1774,31 @@ Panel {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       width: parent.width * 0.66
-      columns: root.appScalePresets.length
+      columns: appRow.slots.length
       spacing: Style.spacing.xs
 
       readonly property real cellWidth: (width - spacing * (columns - 1)) / columns
 
       Repeater {
-        model: root.appScalePresets
+        model: appRow.slots
 
         Pill {
           required property string modelData
           required property int index
 
-          text: modelData === "auto" ? "Auto" : modelData + "×"
+          text: modelData === "auto" ? "Auto" : (modelData === "relaunch" ? "󰑓" : modelData + "×")
           section: appRow.section
           pillIndex: index
-          active: root.appScaleIndex(appRow.app) === index
+          active: modelData === "relaunch" ? (appRow.app !== null && root.relaunchingApp === appRow.app.id) : root.appScaleIndex(appRow.app) === index
           width: appPills.cellWidth
           horizontalPadding: Style.spacing.xs
-          onClicked: if (appRow.app) root.setAppScale(appRow.app.id, modelData)
+          opacity: modelData !== "relaunch" || appRow.canRelaunch ? 1 : 0
+          enabled: modelData !== "relaunch" || appRow.canRelaunch
+          onClicked: {
+            if (!appRow.app) return
+            if (modelData === "relaunch") root.relaunchApp(appRow.app.id)
+            else root.setAppScale(appRow.app.id, modelData)
+          }
         }
       }
     }

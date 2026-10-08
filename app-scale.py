@@ -3,10 +3,12 @@
 
 Usage: app-scale.py list
        app-scale.py set APP_ID SCALE|auto [KIND]
+       app-scale.py relaunch APP_ID
 
 Hyprland scales whole monitors; it has no per-window scale. Each app is
-scaled through its own toolkit instead, and the factor takes effect the next
-time the app starts:
+scaled through its own toolkit instead. Most toolkits only read the factor
+at startup, so `relaunch` closes the app and starts it again; open foot
+windows are resized on the spot instead (see apply_live_foot):
 
 - Chromium-based browsers whose launcher reads ~/.config/<name>-flags.conf
   get --force-device-scale-factor in that file. Omarchy launches browsers by
@@ -23,6 +25,7 @@ with an open window, and every app that already has a factor set.
 """
 
 import json
+import math
 import os
 import re
 import shlex
@@ -31,6 +34,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 # id, display name, launcher candidates, flags file, main-process paths
 # (prefixes of argv[0], used to match windows and read the running factor).
@@ -60,6 +64,8 @@ DESKTOP_ID_RE = re.compile(r"^[^/\0]+$")
 # Launchers are small wrappers; never scan a real browser binary.
 LAUNCHER_MAX_BYTES = 4 * 1024 * 1024
 HERE = os.path.dirname(os.path.realpath(__file__))
+# Terminals are never relaunched: that would end whatever runs inside them.
+NO_RELAUNCH = ("alacritty", "kitty", "ghostty")
 
 
 def home() -> str:
@@ -310,6 +316,7 @@ def app_record(app_id, name, method, kind, file, scale, xwayland, reason="", is_
         "open": is_open,
         # True when an open window runs at another factor than the saved one.
         "stale": False,
+        "relaunchable": not reason and method != "none" and kind not in TERMINALS,
     }
 
 
@@ -326,19 +333,24 @@ def flags_app(entry):
                       "--ozone-platform=x11" in tokens)
 
 
-def list_apps() -> list:
+def scan():
+    """(apps by id, {app id: [(window address, pid), ...]})."""
     apps = {}
+    owned = {}
     for entry in FLAGS_APPS:
         app = flags_app(entry)
         if app:
             apps[app["id"]] = app
 
-    seen_pids = set()
+    live = live_scales()
+    seen_pids = {}
     for client in windows():
         pid = int(client["pid"])
         if pid in seen_pids:
+            if seen_pids[pid]:
+                owned.setdefault(seen_pids[pid], []).append((client.get("address"), pid))
             continue
-        seen_pids.add(pid)
+        seen_pids[pid] = None
         exe = proc_exe(pid)
         window_class = client.get("class") or ""
         xwayland = bool(client.get("xwayland"))
@@ -346,6 +358,8 @@ def list_apps() -> list:
         flags_entry = next((e for e in FLAGS_APPS if any(exe.startswith(p) for p in e[4])), None)
         if flags_entry and flags_entry[0] in apps:
             app = apps[flags_entry[0]]
+            seen_pids[pid] = app["id"]
+            owned.setdefault(app["id"], []).append((client.get("address"), pid))
             app["open"] = True
             if flag_in(proc_argv(pid)[1:]) != app["scale"]:
                 app["stale"] = True
@@ -371,7 +385,9 @@ def list_apps() -> list:
                 tilde(os.path.join(user_apps_dir(), desktop_id + ".desktop")),
                 scale, xwayland, reason, True)
         app["open"] = True
-        running = proc_env(pid, "OMAMONITOR_SCALE") or ""
+        seen_pids[pid] = app["id"]
+        owned.setdefault(app["id"], []).append((client.get("address"), pid))
+        running = live.get(str(pid), proc_env(pid, "OMAMONITOR_SCALE") or "")
         if running and valid_scale(running):
             running = normalize(running)
         if app["supported"] and running != app["scale"]:
@@ -393,7 +409,172 @@ def list_apps() -> list:
         apps[desktop_id] = app_record(desktop_id, parse_entry(path).get("Name") or desktop_id,
                                       "desktop", kind, tilde(path), scale, False)
 
+    return apps, owned
+
+
+def list_apps() -> list:
+    apps = scan()[0]
     return sorted(apps.values(), key=lambda a: (not a["supported"], a["name"].lower()))
+
+
+# ------------------------------------------------------------------- live
+
+def live_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return os.path.join(runtime, "omamonitor-live.json")
+
+
+def live_scales() -> dict:
+    """pid -> factor for windows resized live, dropping exited processes."""
+    try:
+        with open(live_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {pid: v for pid, v in data.items() if os.path.exists("/proc/" + pid)}
+
+
+def save_live(data: dict) -> None:
+    write_atomic(live_path(), json.dumps(data), 0o600)
+
+
+def hypr(lua: str) -> str:
+    out = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True, timeout=3)
+    return (out.stdout + out.stderr).strip()
+
+
+def press(address: str, mods: str, key: str) -> None:
+    # Down and up as two events: a single send_shortcut can leave the key stuck.
+    for state in ("down", "up"):
+        hypr('hl.dsp.send_key_state({ mods = "%s", key = "%s", state = "%s", window = "address:%s" })'
+             % (mods, key, state, address))
+        time.sleep(0.02)
+
+
+def foot_font_px() -> tuple:
+    """(base font size in px, zoom step) from foot.ini. The step is ("px", n)
+    or ("pct", n); foot's default is 0.5 pt, and foot converts points to
+    pixels at 96 dpi before the monitor scale is applied."""
+    base, step = None, ("px", 0.5 * 96 / 72)
+    section = "main"
+    for line in read_lines(os.path.join(config_home(), "foot", "foot.ini")):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped.strip("[]")
+            continue
+        if section != "main" or "=" not in stripped or stripped.startswith("#"):
+            continue
+        key, value = [x.strip() for x in stripped.split("=", 1)]
+        if key == "font" and base is None:
+            match = re.search(r"pixelsize=([\d.]+)", value)
+            if match:
+                base = float(match.group(1))
+            else:
+                match = re.search(r"(?<!pixel)size=([\d.]+)", value)
+                base = float(match.group(1)) * 96 / 72 if match else None
+        elif key == "font-size-adjustment":
+            match = re.match(r"^([\d.]+)\s*(px|%)?$", value)
+            if match:
+                n = float(match.group(1))
+                unit = match.group(2)
+                step = ("pct", n) if unit == "%" else ("px", n if unit == "px" else n * 96 / 72)
+    return (base or 8 * 96 / 72), step
+
+
+def apply_live_foot(app_id: str, scale: str) -> None:
+    """Resize open foot windows with foot's own zoom keys: reset to the size
+    the window started with, then zoom in or out to the target. Zoom moves in
+    fixed steps, so the result is the closest step to the factor."""
+    target = 1.0 if scale == "auto" else float(scale)
+    base, (unit, step) = foot_font_px()
+    live = live_scales()
+    for address, pid in scan()[1].get(app_id, []):
+        if not address:
+            continue
+        started = proc_env(pid, "OMAMONITOR_SCALE")
+        start = float(started) if started and valid_scale(started) else 1.0
+        if unit == "pct":
+            steps = round(math.log(target / start) / math.log(1 + step / 100))
+        else:
+            steps = round(base * (target - start) / step)
+        press(address, "CTRL", "0")
+        for _ in range(abs(steps)):
+            press(address, "CTRL", "equal" if steps > 0 else "minus")
+        live[str(pid)] = "" if scale == "auto" else scale
+    save_live(live)
+
+
+def wait_gone(pids, seconds: float) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not any(os.path.exists("/proc/%d" % p) for p in pids):
+            return True
+        time.sleep(0.2)
+    return not any(os.path.exists("/proc/%d" % p) for p in pids)
+
+
+def launch(argv: list) -> None:
+    subprocess.Popen(["uwsm-app", "--"] + argv, start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def relaunch(app_id: str) -> None:
+    apps, owned = scan()
+    app = apps.get(app_id)
+    if not app:
+        raise ValueError("%s is not open" % app_id)
+    if not app["relaunchable"]:
+        raise ValueError("%s cannot be relaunched from here" % app["name"])
+    windows_ = owned.get(app_id, [])
+    pids = sorted({pid for _, pid in windows_})
+    if not pids:
+        raise ValueError("%s has no open window" % app["name"])
+
+    if app["method"] == "flags":
+        # A browser asked to quit saves its session; closing windows one by
+        # one would leave only the last window to restore.
+        for pid in pids:
+            os.kill(pid, 15)
+        if not wait_gone(pids, 15):
+            raise ValueError("%s did not quit" % app["name"])
+        entry = next(e for e in FLAGS_APPS if e[0] == app_id)
+        launcher = next((c for c in entry[2] if shutil.which(c)), entry[2][0])
+        launch([launcher, "--restore-last-session"])
+        return
+
+    # Close the windows like the user would, one at a time, so the app can
+    # save its state. A close sent while another of the app's windows is up
+    # can be ignored, so each window is asked twice before giving up.
+    asked = {}
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if wait_gone(pids, 0):
+            break
+        left = [c for c in windows() if int(c["pid"]) in pids]
+        if not left:
+            # No window but still running: it lives on in the tray, and
+            # terminating it is what quitting from the tray would do.
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)
+                except ProcessLookupError:
+                    pass
+            if not wait_gone(pids, 5):
+                raise ValueError("%s did not quit; close it and open it again" % app["name"])
+            break
+        fresh = [c for c in left if asked.get(c.get("address"), 0) < 2]
+        if fresh:
+            target = sorted(fresh, key=lambda c: (asked.get(c.get("address"), 0), not c.get("title")))[0]
+            asked[target.get("address")] = asked.get(target.get("address"), 0) + 1
+            hypr('hl.dsp.window.close({ window = "address:%s" })' % target.get("address"))
+        time.sleep(0.8)
+    else:
+        # A window that stays up after being closed is asking something
+        # (unsaved work): never kill it.
+        raise ValueError("%s is still open, maybe asking to save; answer it, then relaunch again" % app["name"])
+    launch(["gtk-launch", app_id + ".desktop"])
 
 
 # ------------------------------------------------------------------ setting
@@ -484,9 +665,11 @@ def set_scale(app_id: str, scale: str, kind: str) -> None:
     if entry:
         set_flags(entry, scale)
         return
-    if scale != "auto" and not kind:
-        kind = override_state(app_id)[1] or ""
+    kind = kind or override_state(app_id)[1] or ""
     set_desktop(app_id, scale, kind)
+    # foot has zoom keys, so open windows follow at once; other apps relaunch.
+    if kind == "foot":
+        apply_live_foot(app_id, scale)
 
 
 def main() -> int:
@@ -499,10 +682,14 @@ def main() -> int:
             set_scale(args[1], args[2], args[3] if len(args) == 4 else "")
             print("ok")
             return 0
+        if len(args) == 2 and args[0] == "relaunch":
+            relaunch(args[1])
+            print("ok")
+            return 0
     except (ValueError, OSError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
-    print("usage: app-scale.py list | set APP_ID SCALE|auto [KIND]", file=sys.stderr)
+    print("usage: app-scale.py list | set APP_ID SCALE|auto [KIND] | relaunch APP_ID", file=sys.stderr)
     return 2
 
 
