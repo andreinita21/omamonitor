@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "andreinita21.omamonitor",
   "name": "Omamonitor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "andreinita21",
-  "description": "Display panel with a drag-and-drop monitor arrangement editor: position, resolution, refresh rate, scale and rotation, applied live and saved to monitors.lua, plus per-app scaling for Chromium-based browsers and Electron apps",
+  "description": "Display panel with a drag-and-drop monitor arrangement editor: position, resolution, refresh rate, scale and rotation, applied live and saved to monitors.lua, plus per-app scaling for open apps",
   "kinds": [
     "bar-widget"
   ],

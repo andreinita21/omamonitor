@@ -16,9 +16,10 @@ import "Model.js" as Model
 // (hl.monitor calls) pushes the layout live and write-monitors.py regenerates
 // ~/.config/hypr/monitors.lua so it survives a reboot.
 //
-// App scaling sets a per-app factor for Chromium-based browsers and Electron
-// apps through app-scale.py, which edits --force-device-scale-factor in
-// their ~/.config/<name>-flags.conf. It takes effect when the app restarts.
+// App scaling lists the open apps (plus browsers and apps already scaled) and
+// sets a factor for each through app-scale.py: a browser's flags file, or a
+// desktop entry override that starts the app through omamonitor-scale-run.
+// It takes effect when the app restarts.
 //
 // Connected displays are switched on automatically. The exceptions are the
 // laptop panel while Omarchy's clamshell handling holds it off (lid closed)
@@ -86,8 +87,9 @@ Panel {
   readonly property var rotationValues: [0, 1, 2, 3]
 
   // ---- App scaling ----
-  // From `app-scale.py list`: { id, name, file, scale ("" = auto), xwayland,
-  // running (scale the running instance started with, or null) }.
+  // From `app-scale.py list`: { id, name, method, kind, file, scale ("" =
+  // auto), xwayland, supported, reason, open, stale (an open window runs at
+  // another factor) }.
   property var apps: []
   property var pendingAppScale: null
   readonly property var appScalePresets: ["auto", "1", "1.1", "1.25", "1.5", "1.75", "2"]
@@ -138,7 +140,7 @@ Panel {
         list.push("rotation")
       }
     }
-    for (var i = 0; i < apps.length; i++) list.push("app:" + apps[i].id)
+    for (var i = 0; i < apps.length; i++) if (apps[i].supported) list.push("app:" + apps[i].id)
     return list
   }
 
@@ -604,16 +606,19 @@ Panel {
       if (copy.id === id) copy.scale = value === "auto" ? "" : value
       next.push(copy)
     }
+    var kind = ""
+    for (var k = 0; k < next.length; k++) if (next[k].id === id) kind = String(next[k].kind || "")
     root.apps = next
     if (appSetProc.running) { root.pendingAppScale = { id: id, scale: value }; return }
     root.applyError = ""
-    appSetProc.command = ["python3", root.pluginDir + "/app-scale.py", "set", id, value]
+    appSetProc.command = ["python3", root.pluginDir + "/app-scale.py", "set", id, value, kind]
     appSetProc.running = true
   }
 
   function appScaleIpc(id, scale) {
     for (var i = 0; i < root.apps.length; i++) {
       if (root.apps[i].id !== id) continue
+      if (!root.apps[i].supported) return root.apps[i].name + ": " + root.apps[i].reason
       setAppScale(id, scale)
       return "ok"
     }
@@ -632,9 +637,11 @@ Panel {
 
   function appHint(app) {
     if (!app) return ""
-    if (app.running !== null && app.running !== undefined && app.running !== app.scale)
-      return "relaunch to apply"
+    if (!app.supported) return app.reason
+    if (app.stale) return "relaunch to apply"
     if (app.xwayland) return "XWayland · same on every monitor"
+    if (app.kind === "gtk3") return "GTK 3 · scales text only"
+    if (["foot", "alacritty", "kitty", "ghostty"].indexOf(app.kind) >= 0) return "font size × the factor"
     return "× the monitor scale"
   }
 
@@ -1591,7 +1598,7 @@ Panel {
               Text {
                 id: appHeaderHint
                 textFormat: Text.PlainText
-                text: "applies the next time the app starts"
+                text: "open apps · applies the next time an app starts"
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1662,18 +1669,19 @@ Panel {
     required property var app
 
     readonly property string section: app ? "app:" + app.id : ""
+    readonly property bool supported: app ? app.supported === true : false
     readonly property bool hasCursor: root.cursorActive && root.focusSection === section
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(appRow)
 
     width: appColumn.width
     implicitHeight: Math.max(appLabel.implicitHeight, appPills.implicitHeight)
+    opacity: supported ? 1.0 : 0.55
 
     Column {
       id: appLabel
       anchors.left: parent.left
       anchors.leftMargin: Style.space(6)
-      anchors.right: appPills.left
-      anchors.rightMargin: Style.space(8)
+      width: (appRow.supported ? appPills.x : parent.width) - Style.space(14)
       anchors.verticalCenter: parent.verticalCenter
       spacing: 0
 
@@ -1700,6 +1708,7 @@ Panel {
 
     Grid {
       id: appPills
+      visible: appRow.supported
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       width: parent.width * 0.66

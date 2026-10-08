@@ -1,0 +1,118 @@
+#!/bin/bash
+# Runs an app at its own scale. Omamonitor's App scaling writes this in front
+# of an app's Exec line in ~/.local/share/applications, for example:
+#
+#   Exec=omamonitor-scale-run --scale=1.25 --kind=qt kdenlive %U
+#
+# It can also be put in front of a command by hand (a keybinding, a script).
+#
+# Kinds and what they do:
+#   qt                          QT_SCALE_FACTOR
+#   gtk3                        GDK_DPI_SCALE (GTK 3 scales text only)
+#   chromium                    --force-device-scale-factor (Chromium, Electron)
+#   foot, alacritty, kitty, ghostty
+#                               the configured font size times the factor
+
+scale=""
+kind=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --scale=*) scale=${1#--scale=} ;;
+    --kind=*) kind=${1#--kind=} ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+  shift
+done
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: omamonitor-scale-run --scale=FACTOR --kind=KIND COMMAND [ARGS...]" >&2
+  exit 2
+fi
+
+if [[ ! $scale =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  exec "$@"
+fi
+
+export OMAMONITOR_SCALE=$scale
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+
+times() {
+  awk -v a="$1" -v b="$scale" 'BEGIN { v = a * b; printf (v == int(v) ? "%d" : "%.1f"), v }'
+}
+
+# Value of the first `key = value` / `key value` line in a config file.
+config_value() {
+  local file=$1 pattern=$2
+  [[ -f $file ]] || return
+  sed -nE "s/^[[:space:]]*${pattern}[[:space:]]*=?[[:space:]]*([0-9.]+).*/\1/p" "$file" | head -1
+}
+
+# Options go right after the program so trailing arguments (-e ...) keep working.
+program=$1
+shift
+extra=()
+
+case $kind in
+  qt)
+    export QT_SCALE_FACTOR=$scale
+    ;;
+  gtk3)
+    export GDK_DPI_SCALE=$scale
+    ;;
+  chromium)
+    if [[ ${program##*/} == flatpak ]]; then
+      # `flatpak run ... APP`: the switch has to reach the app, so it goes last.
+      exec "$program" "$@" --force-device-scale-factor="$scale"
+    fi
+    extra=(--force-device-scale-factor="$scale")
+    ;;
+  foot)
+    # Scale every font line in [main], keeping family and style.
+    ini=$config/foot/foot.ini
+    found=0
+    if [[ -f $ini ]]; then
+      section=main
+      while IFS= read -r line; do
+        if [[ $line =~ ^[[:space:]]*\[([^]]+)\] ]]; then
+          section=${BASH_REMATCH[1]}
+          continue
+        fi
+        [[ $section == main ]] || continue
+        if [[ $line =~ ^[[:space:]]*(font|font-bold|font-italic|font-bold-italic)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+          key=${BASH_REMATCH[1]}
+          value=${BASH_REMATCH[2]}
+          scaled=$(awk -v s="$scale" '{
+            out = ""
+            while (match($0, /(pixel)?size=[0-9.]+/)) {
+              pair = substr($0, RSTART, RLENGTH)
+              split(pair, kv, "=")
+              v = kv[2] * s
+              out = out substr($0, 1, RSTART - 1) kv[1] "=" (v == int(v) ? sprintf("%d", v) : sprintf("%.1f", v))
+              $0 = substr($0, RSTART + RLENGTH)
+            }
+            print out $0
+          }' <<<"$value")
+          [[ $scaled == "$value" ]] && scaled="$value:size=$(times 8)"
+          extra+=(-o "$key=$scaled")
+          found=1
+        fi
+      done <"$ini"
+    fi
+    [[ $found == 1 ]] || extra=(-o "font=monospace:size=$(times 8)")
+    ;;
+  alacritty)
+    base=$(config_value "$config/alacritty/alacritty.toml" size)
+    extra=(-o "font.size=$(times "${base:-11.25}")")
+    ;;
+  kitty)
+    base=$(config_value "$config/kitty/kitty.conf" font_size)
+    extra=(-o "font_size=$(times "${base:-11}")")
+    ;;
+  ghostty)
+    base=$(config_value "$config/ghostty/config" font-size)
+    extra=(--font-size="$(times "${base:-13}")")
+    ;;
+esac
+
+exec "$program" "${extra[@]}" "$@"

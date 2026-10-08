@@ -9,8 +9,8 @@ drag-and-drop monitor arrangement editor. Drag your monitors into place,
 pick a resolution, refresh rate, scale or rotation, and the change lands on
 your running Hyprland session right away and is saved to
 `~/.config/hypr/monitors.lua` so it survives a reboot. No config editing,
-no apply button. It can also give Chromium-based browsers and Electron apps
-their own scale, so a monitor can stay at 1× while Chrome renders at 1.25×.
+no apply button. It can also give each open app its own scale, so a
+monitor can stay at 1× while Chrome or your terminal renders at 1.25×.
 
 It replaces the stock Display widget in the bar and keeps everything that
 widget already does: the brightness slider and the text size slider.
@@ -30,10 +30,10 @@ widget already does: the brightness slider and the text size slider.
   3440x1440 on an ultrawide whose HDMI EDID only lists 16:9 modes, set by
   hand once) is written as a CVT reduced-blanking `modeline`, so arranging
   monitors or reloading Hyprland does not drop it back to the preferred mode.
-- **Per-app scaling.** Hyprland scales whole monitors, not single windows,
-  so the App scaling section sets a factor in the app itself instead: Auto,
-  1×, 1.1×, 1.25×, 1.5×, 1.75× or 2× for each Chromium-based browser or
-  Electron app found on the system. See [Per-app scaling](#per-app-scaling).
+- **Per-app scaling.** Every app with an open window gets a row with
+  Auto, 1×, 1.1×, 1.25×, 1.5×, 1.75× and 2×. Hyprland scales whole
+  monitors, not single windows, so the factor is applied through the app's
+  own toolkit the next time it starts. See [Per-app scaling](#per-app-scaling).
 - **Applies as you go.** Every change is pushed live with `hyprctl eval`
   and written to `monitors.lua` in one step. Quick successive changes are
   coalesced.
@@ -98,46 +98,66 @@ The panel header shows `APPLYING…` while a change is in flight and
 
 ## Per-app scaling
 
-Hyprland has no per-window scale: every window on a monitor is scaled by
-that monitor's factor. Chromium and Electron do have their own, the
-`--force-device-scale-factor` switch, and the Arch launchers for those apps
-read extra switches from a flags file in `~/.config`. The App scaling
-section edits that one switch and leaves the rest of the file alone.
+Hyprland has no per-window scale: every window on a monitor is drawn at
+that monitor's factor. So the App scaling section asks each app to scale
+itself, using whatever its toolkit offers. It lists every app with an open
+window, the installed Chromium-based browsers, and any app you already gave
+a factor, even while it is closed.
 
-| App | Flags file |
+| App | How the factor is applied |
 | --- | --- |
-| Chromium | `~/.config/chromium-flags.conf` |
-| Google Chrome | `~/.config/chrome-flags.conf` |
-| Brave | `~/.config/brave-flags.conf` |
-| Brave Origin | `~/.config/brave-origin-flags.conf` |
-| Microsoft Edge | `~/.config/microsoft-edge-stable-flags.conf` |
-| Visual Studio Code | `~/.config/code-flags.conf` |
-| Electron apps (Arch's shared `electron` runtime) | `~/.config/electron-flags.conf` |
+| Chromium, Google Chrome, Brave, Brave Origin, Edge | `--force-device-scale-factor` in the browser's `~/.config/<name>-flags.conf` |
+| Electron apps (Discord, VS Code, Obsidian, …) | `--force-device-scale-factor` on the command line |
+| Qt 5 / Qt 6 apps | `QT_SCALE_FACTOR` |
+| GTK 3 apps | `GDK_DPI_SCALE`, which scales text only |
+| foot, Alacritty, kitty, Ghostty | the font size from the terminal's config, times the factor |
+| GTK 4 apps (Files, …) | not possible: GTK 4 has no per-app scale, so the row is greyed out |
 
-An app shows up when its launcher is installed and actually reads that file
-(or the file already exists). Omarchy's web apps run in your browser, so
-they follow the browser's setting.
+Browsers keep the setting in their flags file because Omarchy launches them
+by the first word of their desktop entry. Every other app gets a desktop
+entry override in `~/.local/share/applications` whose `Exec` lines start
+with `omamonitor-scale-run`, a small wrapper installed in `~/.local/bin`:
 
-Picking **1.25×** writes `--force-device-scale-factor=1.25`; **Auto**
-removes the switch so the app goes back to its default. What the factor
-means depends on how the app talks to the display:
+```ini
+[Desktop Entry]
+X-Omamonitor-Scale=1.25
+X-Omamonitor-Created=true
+Exec=omamonitor-scale-run --scale=1.25 --kind=qt kdenlive %F
+```
 
-- **Wayland** (Chromium's default): the factor multiplies the monitor's
-  scale. Chromium at 1.25× is 1.25× on a 1× monitor and 1.5625× on a 1.25×
-  monitor. Auto follows the monitor scale times GNOME's text scaling
-  factor, which the Text size slider sets.
-- **XWayland** (`--ozone-platform=x11` in the flags file): Omarchy turns
-  Hyprland's XWayland scaling off, so the factor is the app's whole scale
-  and it looks the same size on every monitor. The row says so.
+The Omarchy app launcher, `xdg-terminal-exec` (Super+Return) and anything
+else that starts apps from their desktop entry go through the override. A
+command started some other way, such as a keybinding that runs `foot`
+directly, needs the wrapper in front of it:
 
-The switch is only read at startup. When the app is already running with a
-different factor, its row says `relaunch to apply`.
+```lua
+launch = "omamonitor-scale-run --scale=1.25 --kind=foot foot"
+```
 
-From a keybinding or a script, the same change goes through IPC:
+Choosing **Auto** takes the factor away again: the switch is removed from a
+flags file, an override Omamonitor created is deleted, and one you already
+had is put back to its old `Exec` lines.
+
+What a factor means depends on how the app talks to the display:
+
+- **Wayland**: the factor multiplies the monitor's scale. An app at 1.25×
+  is 1.25× on a 1× monitor and 1.5625× on a 1.25× monitor. With no factor,
+  Chromium follows the monitor scale times GNOME's text scaling factor,
+  which the Text size slider sets.
+- **XWayland** (for example `--ozone-platform=x11` in a browser's flags
+  file): Omarchy turns Hyprland's XWayland scaling off, so the factor is
+  the app's whole scale and it looks the same size on every monitor. The
+  row says so.
+
+Apps only read the factor at startup. When an open window runs at a
+different factor than the one saved, its row says `relaunch to apply`.
+
+From a keybinding or a script, the same change goes through IPC, using the
+browser name or the app's desktop entry id:
 
 ```bash
 omarchy-shell omarchy.monitor appScale chromium 1.25
-omarchy-shell omarchy.monitor appScale chromium auto
+omarchy-shell omarchy.monitor appScale foot auto
 ```
 
 ## What it writes
@@ -169,9 +189,10 @@ file is preserved.
 A laptop panel held off by the lid keeps whatever rule it had, so opening
 the lid brings it back to its previous position and scale.
 
-App scaling writes only the `--force-device-scale-factor` line of the flags
-files listed above. A flags file that is a symlink (a dotfiles setup, for
-example) is updated in place.
+App scaling writes only the `--force-device-scale-factor` line of a
+browser's flags file, and only the `Exec` lines and `X-Omamonitor-*` keys
+of a desktop entry. Files that are symlinks (a dotfiles setup, for
+example) are updated in place.
 
 ## How it works
 
@@ -181,7 +202,8 @@ example) is updated in place.
 | `Model.js` | Pure layout logic: parsing `hyprctl monitors all -j`, snapping and placement, mode and scale lists, Lua generation |
 | `display-state.sh` | Reads the monitor list, lid state, clamshell state and the outputs pinned off in `monitors.lua` |
 | `write-monitors.py` | Validates the layout and rewrites `monitors.lua` atomically |
-| `app-scale.py` | Finds the scalable apps and reads or rewrites their `--force-device-scale-factor` flag |
+| `app-scale.py` | Lists the open apps and their toolkits, and writes the flags files and desktop entry overrides |
+| `omamonitor-scale-run` | Starts an app at its factor; copied to `~/.local/bin` when first needed |
 
 Changes are applied with `hyprctl eval` and `hl.monitor()` calls rather than
 `hyprctl keyword`, which Hyprland's Lua config mode does not accept.
