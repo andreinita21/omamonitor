@@ -16,6 +16,10 @@ import "Model.js" as Model
 // (hl.monitor calls) pushes the layout live and write-monitors.py regenerates
 // ~/.config/hypr/monitors.lua so it survives a reboot.
 //
+// App scaling sets a per-app factor for Chromium-based browsers and Electron
+// apps through app-scale.py, which edits --force-device-scale-factor in
+// their ~/.config/<name>-flags.conf. It takes effect when the app restarts.
+//
 // Connected displays are switched on automatically. The exceptions are the
 // laptop panel while Omarchy's clamshell handling holds it off (lid closed)
 // and any output switched off in this panel on purpose, which monitors.lua
@@ -80,6 +84,13 @@ Panel {
     ? Model.availableScales(scalePresets, selectedEntry.width, selectedEntry.height)
     : scalePresets
   readonly property var rotationValues: [0, 1, 2, 3]
+
+  // ---- App scaling ----
+  // From `app-scale.py list`: { id, name, file, scale ("" = auto), xwayland,
+  // running (scale the running instance started with, or null) }.
+  property var apps: []
+  property var pendingAppScale: null
+  readonly property var appScalePresets: ["auto", "1", "1.1", "1.25", "1.5", "1.75", "2"]
   readonly property var resolutionOptions: selectedEntry ? Model.resolutionOptions(selectedEntry) : []
   readonly property var refreshOptions: selectedEntry ? Model.refreshOptions(selectedEntry) : []
 
@@ -92,6 +103,7 @@ Panel {
   //   "refresh"    - single row, h/l cycles refresh rates, Enter opens the list
   //   "scale"      - horizontal pills, h/l moves, Enter applies
   //   "rotation"   - horizontal pills, same as scale
+  //   "app:<id>"   - one per scalable app, horizontal pills like scale
   // Mouse hover on a target updates root state via the components' hover
   // signals so keyboard cursor and pointer share one highlight.
   property string focusSection: "monitors"
@@ -126,13 +138,19 @@ Panel {
         list.push("rotation")
       }
     }
+    for (var i = 0; i < apps.length; i++) list.push("app:" + apps[i].id)
     return list
+  }
+
+  function appIdOf(section) {
+    return section.indexOf("app:") === 0 ? section.slice(4) : ""
   }
 
   function sectionCount(section) {
     if (section === "monitors") return draft.length
     if (section === "scale") return scaleValues.length
     if (section === "rotation") return rotationValues.length
+    if (appIdOf(section)) return appScalePresets.length
     return 0
   }
 
@@ -180,7 +198,7 @@ Panel {
   // h/l inside horizontal sections. Sliders handle their own horizontal
   // motion in the key catcher; mode/refresh rows cycle their options.
   function moveCursorH(delta) {
-    if (focusSection === "scale" || focusSection === "rotation") {
+    if (focusSection === "scale" || focusSection === "rotation" || appIdOf(focusSection)) {
       var count = sectionCount(focusSection)
       var next = selectedIndex + delta
       if (next < 0) next = 0
@@ -225,7 +243,11 @@ Panel {
     }
     if (focusSection === "rotation" && selectedIndex >= 0 && selectedIndex < rotationValues.length) {
       setRotation(rotationValues[selectedIndex])
+      return
     }
+    var appId = appIdOf(focusSection)
+    if (appId && selectedIndex >= 0 && selectedIndex < appScalePresets.length)
+      setAppScale(appId, appScalePresets[selectedIndex])
   }
 
   function clampCursor() {
@@ -292,6 +314,7 @@ Panel {
       lidClosed: root.lidClosed,
       clamshellHold: root.clamshellHold,
       userDisabled: Object.keys(root.userDisabled),
+      apps: root.apps,
       monitors: root.monitors,
       draft: root.draft
     })
@@ -303,6 +326,7 @@ Panel {
     function brightness(percent: string): string { return root.brightnessIpc(percent) }
     function state(): string { return root.stateIpc() }
     function refresh(): void { root.refresh() }
+    function appScale(id: string, scale: string): string { return root.appScaleIpc(id, scale) }
     function open() { root.open() }
     function close() { root.close() }
     function toggle() { root.toggle() }
@@ -313,6 +337,7 @@ Panel {
   function refresh() {
     if (!stateProc.running) stateProc.running = true
     if (!monitorsProc.running) monitorsProc.running = true
+    if (root.opened && !appsProc.running && !appSetProc.running) appsProc.running = true
   }
 
   // ---- Brightness ----
@@ -567,6 +592,52 @@ Panel {
     settleRefresh.restart()
   }
 
+  // ---- App scaling ----
+  function setAppScale(id, scale) {
+    var value = scale === "auto" ? "auto" : Model.normalizeScale(scale)
+    if (!value) return
+    // Show the choice right away; the re-read after the write confirms it.
+    var next = []
+    for (var i = 0; i < root.apps.length; i++) {
+      var copy = {}
+      for (var key in root.apps[i]) copy[key] = root.apps[i][key]
+      if (copy.id === id) copy.scale = value === "auto" ? "" : value
+      next.push(copy)
+    }
+    root.apps = next
+    if (appSetProc.running) { root.pendingAppScale = { id: id, scale: value }; return }
+    root.applyError = ""
+    appSetProc.command = ["python3", root.pluginDir + "/app-scale.py", "set", id, value]
+    appSetProc.running = true
+  }
+
+  function appScaleIpc(id, scale) {
+    for (var i = 0; i < root.apps.length; i++) {
+      if (root.apps[i].id !== id) continue
+      setAppScale(id, scale)
+      return "ok"
+    }
+    return "unknown app " + id
+  }
+
+  function appScaleIndex(app) {
+    var current = app && app.scale ? app.scale : "auto"
+    for (var i = 0; i < appScalePresets.length; i++) {
+      var preset = appScalePresets[i]
+      if (preset === current || (preset !== "auto" && current !== "auto"
+          && Model.normalizeScale(preset) === Model.normalizeScale(current))) return i
+    }
+    return -1
+  }
+
+  function appHint(app) {
+    if (!app) return ""
+    if (app.running !== null && app.running !== undefined && app.running !== app.scale)
+      return "relaunch to apply"
+    if (app.xwayland) return "XWayland · same on every monitor"
+    return "× the monitor scale"
+  }
+
   // ---- Text size (shell base font + GTK text-scaling, via one CLI) ----
   function nearestTextStop(px) {
     var best = 0
@@ -677,6 +748,34 @@ Panel {
         var lines = String(text || "").split("\n")
         root.updateMonitors(String(lines[0] || "[]").trim(), String(lines[1] || "{}").trim())
       }
+    }
+  }
+
+  Process {
+    id: appsProc
+    command: ["python3", root.pluginDir + "/app-scale.py", "list"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var list = []
+        try { list = JSON.parse(String(text || "[]")) } catch (e) { list = [] }
+        root.apps = Array.isArray(list) ? list : []
+      }
+    }
+  }
+
+  Process {
+    id: appSetProc
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: appSetErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running) return
+      var err = String(appSetErr.text || "").trim()
+      if (err) root.applyError = "Saving the app scale failed: " + err.split("\n")[0]
+      var pending = root.pendingAppScale
+      root.pendingAppScale = null
+      if (pending) { root.setAppScale(pending.id, pending.scale); return }
+      if (!appsProc.running) appsProc.running = true
     }
   }
 
@@ -798,7 +897,7 @@ Panel {
     focusTarget: keyCatcher
     // Wider than the stock panel so the arrangement canvas has room.
     contentWidth: panel.fittedContentWidth(Style.space(600))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(880))
+    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(1040))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -1464,6 +1563,55 @@ Panel {
 
           }
 
+          // ---------- App scaling ----------
+          PanelSeparator {
+            visible: root.apps.length > 0
+            foreground: root.bar.foreground
+          }
+
+          Column {
+            id: appColumn
+            visible: root.apps.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(appHeader.implicitHeight, appHeaderHint.implicitHeight)
+
+              PanelSectionHeader {
+                id: appHeader
+                text: "APP SCALING"
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: appHeaderHint
+                textFormat: Text.PlainText
+                text: "applies the next time the app starts"
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Repeater {
+              model: root.apps.length
+
+              AppScaleRow {
+                required property int index
+
+                app: root.apps[index] || null
+              }
+            }
+          }
+
           // ---------- Apply failure ----------
           PanelSeparator {
             visible: root.applyError !== ""
@@ -1506,6 +1654,77 @@ Panel {
 
     hasCursor: root.cursorActive && root.focusSection === pill.section && root.selectedIndex === pill.pillIndex
     onHovered: function(isHovered) { if (isHovered) root.setCursor(pill.section, pill.pillIndex) }
+  }
+
+  // One app: name and status on the left, scale presets on the right.
+  component AppScaleRow: Item {
+    id: appRow
+    required property var app
+
+    readonly property string section: app ? "app:" + app.id : ""
+    readonly property bool hasCursor: root.cursorActive && root.focusSection === section
+    onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(appRow)
+
+    width: appColumn.width
+    implicitHeight: Math.max(appLabel.implicitHeight, appPills.implicitHeight)
+
+    Column {
+      id: appLabel
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(6)
+      anchors.right: appPills.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: 0
+
+      Text {
+        textFormat: Text.PlainText
+        text: appRow.app ? appRow.app.name : ""
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+        width: parent.width
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: root.appHint(appRow.app)
+        color: Qt.darker(root.bar.foreground, 1.6)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: parent.width
+      }
+    }
+
+    Grid {
+      id: appPills
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      width: parent.width * 0.66
+      columns: root.appScalePresets.length
+      spacing: Style.spacing.xs
+
+      readonly property real cellWidth: (width - spacing * (columns - 1)) / columns
+
+      Repeater {
+        model: root.appScalePresets
+
+        Pill {
+          required property string modelData
+          required property int index
+
+          text: modelData === "auto" ? "Auto" : modelData + "×"
+          section: appRow.section
+          pillIndex: index
+          active: root.appScaleIndex(appRow.app) === index
+          width: appPills.cellWidth
+          horizontalPadding: Style.spacing.xs
+          onClicked: if (appRow.app) root.setAppScale(appRow.app.id, modelData)
+        }
+      }
+    }
   }
 
   // Label-on-the-left row hosting one control on the right. The row is the
