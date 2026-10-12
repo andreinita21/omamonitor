@@ -198,12 +198,25 @@ hl.env("GDK_SCALE", tostring(omarchy_gdk_scale))
 -- Any monitor not listed below (one plugged in later) gets sane defaults.
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
 
--- Dell Inc. DELL U2412M 0FFXD46G5CHS
-hl.monitor({ output = "HDMI-A-1", mode = "1920x1200@59.95", position = "0x0", scale = 1, transform = 0 })
+-- Chimei Innolux Corporation 0x1471
+hl.monitor({ output = "eDP-1", mode = "1920x1200@60.00", position = "1920x0", scale = 1.25, transform = 0 })
 
 -- Dell Inc. DELL G2724D FS5B4V3
-hl.monitor({ output = "DP-3", mode = "2560x1440@165.08", position = "1920x0", scale = 1.25, transform = 0 })
+hl.monitor({ output = "desc:Dell Inc. DELL G2724D FS5B4V3", mode = "2560x1440@165.08", position = "0x0", scale = 1.25, transform = 0 })
+
+-- Displays not connected when this was written; kept for when they return.
+
+-- Dell Inc. DELL U2412M 0FFXD46G5CHS
+hl.monitor({ output = "desc:Dell Inc. DELL U2412M 0FFXD46G5CHS", mode = "1920x1200@59.95", position = "0x0", scale = 1, transform = 3 })
 ```
+
+External monitors are matched by their description (make, model, serial),
+not by port, so a rule follows its monitor to any port and a different
+monitor plugged into the same port never inherits its mode or rotation.
+The laptop panel stays keyed by port name, which is how Omarchy's clamshell
+scripts find it. Rules for monitors that are not connected are kept, so a
+monitor comes back where it was. Files written by older versions (keyed by
+port) are converted using the description in the comment above each rule.
 
 A monitor you switched off is written as
 `hl.monitor({ output = "...", disabled = true })`, which is also how the
@@ -212,6 +225,26 @@ file is preserved.
 
 A laptop panel held off by the lid keeps whatever rule it had, so opening
 the lid brings it back to its previous position and scale.
+
+## Hotplug
+
+The panel follows the live layout at all times, whether it is open or not.
+It hears about monitors from Hyprland's event socket and from the kernel's
+DRM uevents (`udevadm monitor`), since Hyprland announces nothing for a
+display that comes up disabled. After any plug, unplug or config reload it:
+
+- switches on every connected display that is off, unless the lid holds it
+  or it was switched off in the panel on purpose. In Hyprland's Lua mode an
+  `hl.monitor()` rule can switch an output off but never back on, so this
+  is done with a `hyprctl reload` (skipped while Omarchy's reload guard is
+  paused), once per connection;
+- puts every display back where `monitors.lua` saved it;
+- closes gaps and overlaps, moving new displays first and keeping a cut-off
+  group in one piece, so the pointer can reach every screen.
+
+Those fixes are applied live only; `monitors.lua` changes only when you
+change something in the panel. There is one bar, and so one copy of the
+panel, per screen: only the first copy acts on hotplug.
 
 App scaling writes only the `--force-device-scale-factor` line of a
 browser's flags file, and only the `Exec` lines and `X-Omamonitor-*` keys
@@ -225,8 +258,8 @@ example) are updated in place. Which foot windows were resized live is kept in
 | --- | --- |
 | `Panel.qml` | The bar widget and panel: canvas, controls, keyboard cursor model, apply pipeline |
 | `Model.js` | Pure layout logic: parsing `hyprctl monitors all -j`, snapping and placement, mode and scale lists, Lua generation |
-| `display-state.sh` | Reads the monitor list, lid state, clamshell state and the outputs pinned off in `monitors.lua` |
-| `write-monitors.py` | Validates the layout and rewrites `monitors.lua` atomically |
+| `display-state.sh` | Reads the monitor list, lid state, clamshell state and the rules saved in `monitors.lua` |
+| `write-monitors.py` | Validates the layout and rewrites `monitors.lua` atomically, keeping rules for absent monitors; `--dump` prints the saved rules as JSON, `--migrate` converts a port-keyed file |
 | `app-scale.py` | Lists the open apps and their toolkits, writes the flags files and desktop entry overrides, resizes open foot windows and relaunches apps |
 | `omamonitor-scale-run` | Starts an app at its factor; copied to `~/.local/bin` when first needed |
 

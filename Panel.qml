@@ -58,7 +58,10 @@ Panel {
   property string selectedMonitor: ""
   property bool applying: false
   property bool applyQueued: false
-  property bool adoptLive: false
+  // Applies triggered by hotplug only fix the live layout; changes made in
+  // the panel are also saved to monitors.lua.
+  property bool pendingPersist: false
+  property bool applyPersists: false
   property bool dragging: false
   property string applyError: ""
 
@@ -73,6 +76,12 @@ Panel {
   property var sessionOn: ({})
   // Outputs auto-enable already tried once; cleared when they come on or go.
   property var autoEnableTried: ({})
+  // Rules monitors.lua has saved (write-monitors.py --dump), the outputs seen
+  // on the last read (name -> description), and whether a monitor event
+  // arrived that the layout still has to adapt to.
+  property var savedRules: []
+  property var knownOutputs: null
+  property bool hotplugPending: true
 
   readonly property var liveDraft: Model.draftFrom(monitors)
   readonly property int changeCount: Model.changedCount(draft, liveDraft)
@@ -317,6 +326,7 @@ Panel {
       selected: root.selectedMonitor,
       applying: root.applying,
       dirty: root.dirty,
+      leader: root.isLeader(),
       lidClosed: root.lidClosed,
       clamshellHold: root.clamshellHold,
       userDisabled: Object.keys(root.userDisabled),
@@ -385,63 +395,102 @@ Panel {
     return !entry.enabled && Model.isInternal(entry.name) && (root.lidClosed || root.clamshellHold)
   }
 
+  // One bar (and so one copy of this panel) exists per screen. Only the first
+  // copy reacts to hotplug, so several copies never race to rearrange.
+  function leaderInstance() {
+    if (!bar || typeof bar.moduleWidgets !== "function") return root
+    var items = bar.moduleWidgets("andreinita21.omamonitor")
+    if (items.length === 0) items = bar.moduleWidgets(root.moduleName)
+    if (items.length === 0 || items.indexOf(root) < 0) return root
+    return items[0]
+  }
+
+  function isLeader() {
+    return leaderInstance() === root
+  }
+
+  // A monitor event seen by any copy (or a change its own poll noticed).
+  function requestHotplug() {
+    root.hotplugPending = true
+    hotplugSettle.restart()
+  }
+
+  function requestHotplugOnce() {
+    root.hotplugPending = true
+    root.refresh()
+  }
+
   function updateMonitors(monitorsJson, metaJson) {
     var meta = {}
     try { meta = JSON.parse(metaJson || "{}") || {} } catch (e) { meta = {} }
     root.lidClosed = meta.lid === "closed"
     root.clamshellHold = meta.clamshell === true
-    var disabledFromFile = Array.isArray(meta.userDisabled) ? meta.userDisabled : []
-    var merged = {}
-    for (var d = 0; d < disabledFromFile.length; d++) merged[disabledFromFile[d]] = true
-    for (var offKey in root.sessionOff) merged[offKey] = true
-    for (var onKey in root.sessionOn) delete merged[onKey]
+    root.savedRules = Array.isArray(meta.rules) ? meta.rules : []
 
     var parsed = Model.parseMonitors(monitorsJson)
     root.monitors = parsed
 
-    // Bookkeeping for auto-enable: an output that came on, or went away, can
-    // be tried again later.
+    // Which outputs came, went or now carry a different monitor.
+    var previous = root.knownOutputs
     var present = {}
-    var tried = {}
+    var arrived = []
+    var setChanged = previous === null
     for (var i = 0; i < parsed.length; i++) {
-      present[parsed[i].name] = true
-      if (!parsed[i].enabled && root.autoEnableTried[parsed[i].name]) tried[parsed[i].name] = true
+      present[parsed[i].name] = parsed[i].description
+      if (previous !== null && previous[parsed[i].name] !== parsed[i].description) {
+        arrived.push(parsed[i].name)
+        setChanged = true
+      }
     }
-    for (var name in merged) if (!present[name]) delete merged[name]
+    if (previous !== null) for (var gone in previous) if (!(gone in present)) setChanged = true
+    root.knownOutputs = present
+    if (setChanged) {
+      root.hotplugPending = true
+      // Only the leader adapts; make sure it hears about this too.
+      var leader = leaderInstance()
+      if (leader !== root && typeof leader.requestHotplug === "function") leader.requestHotplug()
+    }
+
+    // Deliberately off: saved as disabled for this very monitor, or switched
+    // off in this session and not yet saved.
+    var merged = {}
+    for (var r = 0; r < parsed.length; r++) {
+      var rule = Model.savedRuleFor(parsed[r], root.savedRules)
+      if (rule && rule.disabled) merged[parsed[r].name] = true
+    }
+    for (var offKey in root.sessionOff) if (offKey in present) merged[offKey] = true
+    for (var onKey in root.sessionOn) delete merged[onKey]
     root.userDisabled = merged
-    root.autoEnableTried = tried
 
-    // Never yank the draft out from under a drag.
-    if (root.dragging) return
-
-    var fresh = Model.draftFrom(parsed)
-    for (var f = 0; f < fresh.length; f++) fresh[f].held = isHeld(fresh[f])
-
-    var adopt = root.adoptLive || !root.dirty || root.draft.length === 0
-    root.adoptLive = false
-    if (adopt) {
-      // Anything connected but off, and not held or deliberately off, comes on.
-      var toEnable = []
-      for (var j = 0; j < fresh.length; j++) {
-        var e = fresh[j]
-        if (e.enabled || e.held || merged[e.name] || tried[e.name]) continue
-        toEnable.push(j)
-      }
-      for (var t = 0; t < toEnable.length; t++) {
-        Model.placeEnabled(fresh, toEnable[t])
-        tried[fresh[toEnable[t]].name] = true
-      }
-      root.autoEnableTried = tried
-      if (Model.changedCount(fresh, root.draft) > 0 || fresh.length !== root.draft.length
-          || heldChanged(fresh, root.draft))
-        root.draft = fresh
-      if (toEnable.length > 0) scheduleApply()
-    } else {
-      // Keep the pending draft, but track hold state so the rows stay honest.
+    // Never yank the draft out from under a drag, and let a pending or
+    // running apply finish first; its follow-up refresh lands back here.
+    if (root.dragging || root.applying || applyDebounce.running) {
       var kept = Model.cloneEntries(root.draft)
       for (var k = 0; k < kept.length; k++) kept[k].held = isHeld(kept[k])
       if (heldChanged(kept, root.draft)) root.draft = kept
+      return
     }
+
+    // Everything applies the moment it is changed, so the live layout is the
+    // truth: always start from it.
+    var fresh = Model.draftFrom(parsed)
+    for (var f = 0; f < fresh.length; f++) fresh[f].held = isHeld(fresh[f])
+
+    // Each display gets one automatic switch-on attempt per connection.
+    var tried = {}
+    for (var t in root.autoEnableTried) if (t in present && arrived.indexOf(t) < 0) tried[t] = true
+    root.autoEnableTried = tried
+
+    var needsApply = false
+    if (root.hotplugPending && isLeader()) {
+      root.hotplugPending = false
+      needsApply = adaptLayout(fresh, merged, arrived)
+    }
+
+    if (Model.changedCount(fresh, root.draft) > 0 || fresh.length !== root.draft.length
+        || heldChanged(fresh, root.draft))
+      root.draft = fresh
+    if (needsApply) scheduleApply(true)
 
     if (Model.findIndex(root.draft, root.selectedMonitor) < 0) {
       var pick = ""
@@ -451,6 +500,55 @@ Panel {
       if (!pick && root.draft.length > 0) pick = root.draft[0].name
       root.selectedMonitor = pick
     }
+  }
+
+  // After a monitor came, went or Hyprland reloaded its config: put every
+  // monitor back where monitors.lua saved it, then close any gap or overlap
+  // so the pointer can reach every screen. Returns true when `fresh` now
+  // differs from the live layout.
+  //
+  // Anything connected but off (and not held by the lid or switched off on
+  // purpose) is switched on by reloading the config: in Hyprland's Lua mode
+  // an hl.monitor() rule can switch an output off but never back on, while
+  // a reload drops the stray rule and the saved file brings it up. The
+  // reload fires configreloaded, which lands back here to place it.
+  function adaptLayout(fresh, disabled, arrived) {
+    var live = Model.draftFrom(root.monitors)
+    var tried = {}
+    for (var key in root.autoEnableTried) tried[key] = true
+    var wantReload = false
+    for (var j = 0; j < fresh.length; j++) {
+      var e = fresh[j]
+      if (e.enabled || e.held || disabled[e.name] || tried[e.name]) continue
+      tried[e.name] = true
+      wantReload = true
+    }
+    root.autoEnableTried = tried
+    if (wantReload) {
+      reloadHyprland()
+      return false
+    }
+
+    var movable = arrived.slice()
+    for (var i = 0; i < fresh.length; i++) {
+      var entry = fresh[i]
+      if (!entry.enabled) continue
+      var rule = Model.savedRuleFor(entry, root.savedRules)
+      var pos = rule && !rule.disabled ? Model.parsePosition(rule.position) : null
+      if (pos) {
+        entry.x = pos.x
+        entry.y = pos.y
+      } else if (movable.indexOf(entry.name) < 0) {
+        movable.push(entry.name)
+      }
+    }
+
+    Model.connectLayout(fresh, movable)
+    return Model.changedCount(fresh, live) > 0
+  }
+
+  function reloadHyprland() {
+    if (!reloadProc.running) reloadProc.running = true
   }
 
   function heldChanged(a, b) {
@@ -573,7 +671,8 @@ Panel {
 
   // Changes coalesce for a beat (h/l cycling, quick successive drags) and
   // one apply runs at a time; a change made mid-apply queues another.
-  function scheduleApply() {
+  function scheduleApply(liveOnly) {
+    if (liveOnly !== true) root.pendingPersist = true
     applyDebounce.restart()
   }
 
@@ -583,6 +682,8 @@ Panel {
     root.applyError = ""
     root.applying = true
     root.applyQueued = false
+    root.applyPersists = root.pendingPersist
+    root.pendingPersist = false
     applyProc.command = ["hyprctl", "eval", Model.evalScript(root.draft)]
     applyProc.running = true
   }
@@ -595,7 +696,6 @@ Panel {
   function finishApply() {
     root.applying = false
     if (root.applyQueued) { runApply(); return }
-    root.adoptLive = true
     settleRefresh.restart()
   }
 
@@ -743,7 +843,7 @@ Panel {
   // arrive through Hyprland's event socket whether or not the panel is open,
   // which is what lets a newly connected display come on by itself.
   Timer {
-    interval: 5000
+    interval: 2000
     running: root.opened
     repeat: true
     onTriggered: root.refresh()
@@ -754,9 +854,37 @@ Panel {
     function onRawEvent(event) {
       var name = String(event.name || "")
       if (name === "monitoradded" || name === "monitorremoved" || name === "monitoraddedv2"
-          || name === "configreloaded")
-        hotplugSettle.restart()
+          || name === "monitorremovedv2" || name === "configreloaded")
+        root.requestHotplug()
     }
+  }
+
+  // Omarchy pauses config reloads while packages are being replaced.
+  Process {
+    id: reloadProc
+    command: ["bash", "-c", "omarchy-hyprland-reload-guard paused 2>/dev/null || hyprctl reload"]
+  }
+
+  // Hyprland announces no event for a display that comes up disabled (a
+  // rule pins it off, or it never got a mode), so watch the kernel's DRM
+  // hotplug uevents too: every cable plug and unplug lands here.
+  Process {
+    id: drmWatch
+    running: true
+    command: ["udevadm", "monitor", "--udev", "--subsystem-match=drm"]
+    stdout: SplitParser {
+      onRead: function(line) {
+        if (/\bchange\b/.test(String(line))) root.requestHotplug()
+      }
+    }
+    onRunningChanged: if (!running) drmWatchRestart.restart()
+  }
+
+  Timer {
+    id: drmWatchRestart
+    interval: 5000
+    repeat: false
+    onTriggered: drmWatch.running = true
   }
 
   // Hyprland fires monitor events before the output finishes coming up;
@@ -765,7 +893,19 @@ Panel {
     id: hotplugSettle
     interval: 700
     repeat: false
-    onTriggered: root.refresh()
+    onTriggered: {
+      root.refresh()
+      hotplugRecheck.restart()
+    }
+  }
+
+  // Link training and EDID reads can take a few seconds after the uevent;
+  // look again once things have settled.
+  Timer {
+    id: hotplugRecheck
+    interval: 3000
+    repeat: false
+    onTriggered: root.requestHotplugOnce()
   }
 
   Process {
@@ -885,6 +1025,7 @@ Panel {
         root.finishApply()
         return
       }
+      if (!root.applyPersists) { root.finishApply(); return }
       persistProc.command = ["python3", root.pluginDir + "/write-monitors.py", JSON.stringify(Model.persistPayload(root.draft))]
       persistProc.running = true
     }
@@ -899,6 +1040,11 @@ Panel {
       var err = String(persistErr.text || "").trim()
       if (err) root.applyError = "Applied live, but saving monitors.lua failed: " + err.split("\n")[0]
       else {
+        for (var i = 0; i < root.draft.length; i++) {
+          var e = root.draft[i]
+          var idx = Model.findIndex(root.monitors, e.name)
+          if (e.enabled && idx >= 0 && !root.monitors[idx].enabled) { root.reloadHyprland(); break }
+        }
         // The file now records the session's on/off switches.
         root.sessionOff = {}
         root.sessionOn = {}

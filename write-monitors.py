@@ -4,10 +4,23 @@
 Usage: write-monitors.py '{"monitors": [{"name": "DP-3", "enabled": true,
         "mode": "2560x1440@165.08", "position": "1920x0", "scale": "1.25",
         "transform": 0, "description": "Dell ..."}, ...]}'
+       write-monitors.py --dump      print the saved rules as JSON
+       write-monitors.py --migrate   rewrite the file with identity keys
 
-The whole file is rewritten (the Display panel owns it). The GDK_SCALE value
-already in the file is preserved; without one it is derived from the largest
-enabled scale, because GTK only honours whole-number factors.
+The whole file is rewritten (the Display panel owns it). The payload lists
+the displays connected right now; rules saved earlier for displays that are
+not connected are kept, so a monitor comes back where it was.
+
+External displays are keyed by description (`output = "desc:Make Model
+Serial"`), so a rule follows the monitor instead of the port: a different
+monitor in the same port never inherits its mode or rotation. The laptop
+panel stays keyed by port name because Omarchy's clamshell scripts look it
+up that way. Older files keyed every display by port; those rules are
+converted using the description in the comment above them.
+
+The GDK_SCALE value already in the file is preserved; without one it is
+derived from the largest enabled scale, because GTK only honours
+whole-number factors.
 """
 
 import json
@@ -25,6 +38,11 @@ POSITION_RE = re.compile(r"^-?\d+x-?\d+$")
 SCALE_RE = re.compile(r"^\d+(\.\d+)?$")
 GDK_RE = re.compile(r'^hl\.env\("GDK_SCALE",\s*"?(\d+)"?\)', re.M)
 GDK_LOCAL_RE = re.compile(r"^local omarchy_gdk_scale\s*=\s*(\d+)", re.M)
+RULE_RE = re.compile(r"^[ \t]*hl\.monitor\(\{(.*)\}\)[ \t]*$")
+FIELD_RE = re.compile(r'(\w+)\s*=\s*("(?:[^"\\]|\\.)*"|[^,}\s]+)')
+COMMENT_RE = re.compile(r"^[ \t]*--[ \t]?(.*)$")
+INTERNAL_RE = re.compile(r"^(eDP|LVDS|DSI)-")
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def monitors_path() -> str:
@@ -71,6 +89,91 @@ def lua_comment(text: str) -> str:
     return cleaned or "unnamed display"
 
 
+def lua_string(text: str) -> str:
+    cleaned = re.sub(r"[\r\n]+", " ", str(text))
+    return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def lua_unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return re.sub(r"\\(.)", r"\1", value[1:-1])
+    return value
+
+
+def is_internal(name: str) -> bool:
+    return bool(INTERNAL_RE.match(name))
+
+
+def rule_key(name: str, description: str) -> str:
+    desc = re.sub(r"[\r\n]+", " ", str(description or "")).strip()
+    if is_internal(name) or not desc:
+        return name
+    return "desc:" + desc
+
+
+def parse_rules(text: str) -> list:
+    """Every hl.monitor rule in the file except the catch-all, in order, with
+    the comment line above it. Port-keyed rules for external displays (the
+    old format) get the description from that comment as their key."""
+    rules = []
+    comment = ""
+    for raw in text.splitlines():
+        line = re.sub(r"--\[\[.*?\]\]", "", raw)
+        cm = COMMENT_RE.match(line)
+        if cm:
+            comment = cm.group(1).strip()
+            continue
+        m = RULE_RE.match(line)
+        if not m:
+            if line.strip():
+                comment = ""
+            continue
+        fields = {k: v for k, v in FIELD_RE.findall(m.group(1))}
+        output = lua_unquote(fields.get("output", '""'))
+        if not output:
+            comment = ""
+            continue
+        note = re.sub(r"\s*\(laptop panel;.*\)$", "", comment)
+        key = output
+        if not output.startswith("desc:") and not is_internal(output) and note and note != "unnamed display":
+            key = "desc:" + note
+        rule = {
+            "key": key,
+            "output": output,
+            "comment": note,
+            "disabled": fields.get("disabled") == "true",
+        }
+        for field in ("mode", "position"):
+            if field in fields:
+                rule[field] = lua_unquote(fields[field])
+        for field in ("scale", "transform"):
+            if field in fields:
+                rule[field] = fields[field]
+        rules.append(rule)
+        comment = ""
+    return rules
+
+
+def render_rule(key: str, rule: dict) -> str:
+    """A saved rule re-rendered under `key`, or "" when a field looks off."""
+    if rule.get("disabled"):
+        return "hl.monitor({ output = %s, disabled = true })" % lua_string(key)
+    mode = rule.get("mode", "preferred")
+    position = rule.get("position", "auto")
+    scale = str(rule.get("scale", "1"))
+    transform = str(rule.get("transform", "0"))
+    if not (MODE_RE.match(mode) or mode in ("preferred", "highres", "highrr")):
+        return ""
+    if not (POSITION_RE.match(position) or position.startswith("auto")):
+        return ""
+    if not (SCALE_RE.match(scale) or IDENT_RE.match(scale) or scale == '"auto"'):
+        return ""
+    if not re.match(r"^[0-7]$", transform):
+        return ""
+    return 'hl.monitor({ output = %s, mode = "%s", position = "%s", scale = %s, transform = %s })' % (
+        lua_string(key), mode, position, scale, transform)
+
+
 def existing_rule(text: str, name: str) -> str:
     """The hl.monitor line the file already has for `name`, unless it pins the
     output off. Used for outputs the clamshell toggle is holding: the panel
@@ -87,11 +190,12 @@ def existing_rule(text: str, name: str) -> str:
     return ""
 
 
-def render(monitors: list, gdk_scale: int) -> str:
+def render(monitors: list, kept: list, gdk_scale: int, kept_heading: bool = True) -> str:
     lines = [
-        "-- Monitor layout written by the Display panel (andrei.display shell plugin).",
-        "-- Pressing Apply in the panel regenerates this whole file, so hand edits",
-        "-- made here are lost on the next Apply.",
+        "-- Monitor layout written by the Omamonitor panel (andreinita21.omamonitor).",
+        "-- Every change in the panel regenerates this whole file, so hand edits",
+        "-- made here are lost on the next change. External displays are matched",
+        "-- by description (desc:), so each rule follows its monitor, not the port.",
         "-- List current monitors and supported resolutions with: hyprctl monitors all",
         "",
         "local omarchy_gdk_scale = %d" % gdk_scale,
@@ -111,16 +215,45 @@ def render(monitors: list, gdk_scale: int) -> str:
             lines.append("-- %s (laptop panel; managed by the lid, rule kept as is)" % lua_comment(m["description"]))
             lines.append(m["kept_rule"])
             continue
+        key = lua_string(rule_key(m["name"], m["description"]))
         lines.append("")
         lines.append("-- %s" % lua_comment(m["description"]))
         if not m["enabled"]:
-            lines.append('hl.monitor({ output = "%s", disabled = true })' % m["name"])
+            lines.append("hl.monitor({ output = %s, disabled = true })" % key)
             continue
         lines.append(
-            'hl.monitor({ output = "%s", mode = "%s", position = "%s", scale = %s, transform = %d })'
-            % (m["name"], m["mode"], m["position"], m["scale"], m["transform"])
+            'hl.monitor({ output = %s, mode = "%s", position = "%s", scale = %s, transform = %d })'
+            % (key, m["mode"], m["position"], m["scale"], m["transform"])
         )
+    if kept and kept_heading:
+        lines.append("")
+        lines.append("-- Displays not connected when this was written; kept for when they return.")
+    for comment, line in kept:
+        lines.append("")
+        lines.append("-- %s" % lua_comment(comment))
+        lines.append(line)
     return "\n".join(lines) + "\n"
+
+
+def kept_rules(existing: str, monitors: list) -> list:
+    """Saved rules for displays that are not in the payload, re-keyed."""
+    present_keys = {rule_key(m["name"], m["description"]) for m in monitors}
+    present_names = {m["name"] for m in monitors}
+    kept, seen = [], set()
+    for rule in parse_rules(existing):
+        key = rule["key"]
+        if key in present_keys or key in seen:
+            continue
+        # A port-keyed rule left over for a connected port belongs to
+        # whatever is plugged in there now, which the payload describes.
+        if not key.startswith("desc:") and key in present_names:
+            continue
+        line = render_rule(key, rule)
+        if not line:
+            continue
+        seen.add(key)
+        kept.append((rule["comment"] or key, line))
+    return kept
 
 
 def validate(raw: dict) -> list:
@@ -163,15 +296,36 @@ def validate(raw: dict) -> list:
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: write-monitors.py JSON", file=sys.stderr)
+        print("usage: write-monitors.py JSON | --dump | --migrate", file=sys.stderr)
         return 2
+
+    path = monitors_path()
+    if sys.argv[1] == "--dump":
+        try:
+            print(json.dumps(parse_rules(read_existing(path)), separators=(",", ":")))
+        except OSError:
+            print("[]")
+        return 0
+    if sys.argv[1] == "--migrate":
+        existing = read_existing(path)
+        if not existing:
+            return 0
+        rules = parse_rules(existing)
+        if all(r["output"] == r["key"] for r in rules):
+            print("ok")
+            return 0
+        match = GDK_RE.search(existing) or GDK_LOCAL_RE.search(existing)
+        gdk_scale = int(match.group(1)) if match else 1
+        write_atomic(path, render([], kept_rules(existing, []), gdk_scale, kept_heading=False))
+        print("ok")
+        return 0
+
     try:
         monitors = validate(json.loads(sys.argv[1]))
     except (ValueError, TypeError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
 
-    path = monitors_path()
     existing = read_existing(path)
     for m in monitors:
         if m["held"]:
@@ -183,7 +337,7 @@ def main() -> int:
         largest = max(float(m["scale"]) for m in monitors if m["enabled"])
         gdk_scale = max(1, int(largest + 0.5))
 
-    write_atomic(path, render(monitors, gdk_scale))
+    write_atomic(path, render(monitors, kept_rules(existing, monitors), gdk_scale))
     print("ok")
     return 0
 

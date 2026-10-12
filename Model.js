@@ -461,6 +461,104 @@ function placeEnabled(entries, index) {
   return normalize(entries)
 }
 
+// Groups of enabled entries that touch each other, as index lists.
+function layoutGroups(entries) {
+  var idx = []
+  for (var i = 0; i < entries.length; i++) if (entries[i].enabled) idx.push(i)
+  var group = {}, groups = []
+  for (var s = 0; s < idx.length; s++) {
+    if (group[idx[s]] !== undefined) continue
+    var members = [idx[s]], queue = [idx[s]]
+    group[idx[s]] = groups.length
+    while (queue.length > 0) {
+      var cur = rectOf(entries[queue.shift()])
+      for (var n = 0; n < idx.length; n++) {
+        var other = idx[n]
+        if (group[other] !== undefined) continue
+        var o = rectOf(entries[other])
+        if (touches(cur, o) || overlaps(cur, o)) {
+          group[other] = groups.length
+          members.push(other)
+          queue.push(other)
+        }
+      }
+    }
+    groups.push(members)
+  }
+  return groups
+}
+
+// Index of an enabled entry that overlaps another one, or -1. Entries named
+// in `prefer` are picked first.
+function overlappingEntry(entries, prefer) {
+  var found = -1
+  for (var a = 0; a < entries.length; a++) {
+    if (!entries[a].enabled) continue
+    for (var b = 0; b < entries.length; b++) {
+      if (a === b || !entries[b].enabled) continue
+      if (!overlaps(rectOf(entries[a]), rectOf(entries[b]))) continue
+      if (prefer[entries[a].name]) return a
+      if (found < 0) found = Math.max(a, b)
+    }
+  }
+  return found
+}
+
+// Make the enabled monitors one connected block with no overlaps, moving as
+// little as possible. Entries named in `movable` (displays that just came or
+// changed) are re-placed before anything that was already settled; a group
+// cut off from the rest moves as one piece, so its own arrangement holds.
+function connectLayout(entries, movable) {
+  var prefer = {}
+  for (var i = 0; i < (movable || []).length; i++) prefer[movable[i]] = true
+
+  for (var pass = 0; pass < entries.length * 4; pass++) {
+    var hit = overlappingEntry(entries, prefer)
+    if (hit >= 0) { settleEntry(entries, hit, 0); continue }
+
+    var groups = layoutGroups(entries)
+    if (groups.length < 2) break
+
+    // The main group is the one holding the most settled displays.
+    var main = 0, bestScore = -1
+    for (var g = 0; g < groups.length; g++) {
+      var settled = 0
+      for (var m = 0; m < groups[g].length; m++) if (!prefer[entries[groups[g][m]].name]) settled++
+      var score = settled * 100 + groups[g].length
+      if (score > bestScore) { bestScore = score; main = g }
+    }
+    var mainRects = []
+    for (var r = 0; r < groups[main].length; r++) mainRects.push(rectOf(entries[groups[main][r]]))
+
+    // Pull the nearest other group over until one member is flush with it.
+    var moveGroup = null, anchor = -1, bestGap = Infinity
+    for (var h = 0; h < groups.length; h++) {
+      if (h === main) continue
+      for (var k = 0; k < groups[h].length; k++) {
+        var rect = rectOf(entries[groups[h][k]])
+        for (var q = 0; q < mainRects.length; q++) {
+          var o = mainRects[q]
+          var gapX = Math.max(0, rect.x - (o.x + o.w), o.x - (rect.x + rect.w))
+          var gapY = Math.max(0, rect.y - (o.y + o.h), o.y - (rect.y + rect.h))
+          if (gapX + gapY < bestGap) { bestGap = gapX + gapY; moveGroup = groups[h]; anchor = groups[h][k] }
+        }
+      }
+    }
+    if (!moveGroup) break
+    var before = rectOf(entries[anchor])
+    var placed = rectOf(entries[anchor])
+    attachToNearest(placed, mainRects, 0)
+    resolveOverlap(placed, mainRects)
+    var dx = Math.round(placed.x - before.x), dy = Math.round(placed.y - before.y)
+    if (dx === 0 && dy === 0) { settleEntry(entries, anchor, 0); continue }
+    for (var t = 0; t < moveGroup.length; t++) {
+      entries[moveGroup[t]].x += dx
+      entries[moveGroup[t]].y += dy
+    }
+  }
+  return normalize(entries)
+}
+
 // Unique resolutions for a monitor, largest first, as Dropdown options.
 function resolutionOptions(entry) {
   var options = []
@@ -531,6 +629,41 @@ function isInternal(name) {
   return /^(eDP|LVDS|DSI)-/.test(String(name || ""))
 }
 
+// What a saved rule matches on. External displays are keyed by their EDID
+// description (make, model, serial), so a rule follows the monitor from port
+// to port and never lands on a different monitor plugged into the same port.
+// The laptop panel stays keyed by port: Omarchy's clamshell scripts look it
+// up by name.
+function ruleKey(entry) {
+  var desc = String(entry.description || "").replace(/[\r\n]+/g, " ").trim()
+  if (isInternal(entry.name) || !desc) return String(entry.name)
+  return "desc:" + desc
+}
+
+function luaString(text) {
+  return '"' + String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]+/g, " ") + '"'
+}
+
+// The rule monitors.lua saved for this display, if any. `rules` comes from
+// `write-monitors.py --dump`; old port-keyed rules for external displays only
+// count when their comment names this same monitor.
+function savedRuleFor(entry, rules) {
+  if (!Array.isArray(rules)) return null
+  var key = ruleKey(entry)
+  for (var i = 0; i < rules.length; i++) if (rules[i] && rules[i].key === key) return rules[i]
+  for (var j = 0; j < rules.length; j++) {
+    var r = rules[j]
+    if (!r || r.key !== entry.name) continue
+    if (isInternal(entry.name) || r.comment === entry.description) return r
+  }
+  return null
+}
+
+function parsePosition(text) {
+  var m = /^(-?\d+)x(-?\d+)$/.exec(String(text || ""))
+  return m ? { x: parseInt(m[1], 10), y: parseInt(m[2], 10) } : null
+}
+
 function hasMode(entry) {
   var modes = entry.modes || []
   for (var i = 0; i < modes.length; i++) {
@@ -563,8 +696,9 @@ function modeString(entry) {
 // same hl.monitor() calls the persisted file uses. Wrapped in a function so
 // the whole thing is one expression however eval prefixes it.
 function luaMonitorCall(e) {
-  if (!e.enabled) return 'hl.monitor({ output = "' + e.name + '", disabled = true })'
-  return 'hl.monitor({ output = "' + e.name + '", mode = "' + modeString(e) + '", position = "'
+  var output = luaString(ruleKey(e))
+  if (!e.enabled) return "hl.monitor({ output = " + output + ", disabled = true })"
+  return "hl.monitor({ output = " + output + ', mode = "' + modeString(e) + '", position = "'
     + e.x + "x" + e.y + '", scale = ' + normalizeScale(e.scale) + ", transform = " + (parseInt(e.transform, 10) || 0) + " })"
 }
 
@@ -629,6 +763,12 @@ if (typeof module !== "undefined") {
     bestRefreshFor: bestRefreshFor,
     transformLabel: transformLabel,
     isInternal: isInternal,
+    ruleKey: ruleKey,
+    luaString: luaString,
+    savedRuleFor: savedRuleFor,
+    parsePosition: parsePosition,
+    layoutGroups: layoutGroups,
+    connectLayout: connectLayout,
     luaMonitorCall: luaMonitorCall,
     evalScript: evalScript,
     persistPayload: persistPayload
